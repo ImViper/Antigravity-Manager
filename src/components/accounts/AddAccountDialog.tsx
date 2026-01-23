@@ -92,8 +92,8 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                     let errorMsg = String(error);
                     if (errorMsg.includes('Refresh Token') || errorMsg.includes('refresh_token')) {
                         setMessage(errorMsg);
-                    } else if (errorMsg.includes('Tauri') || errorMsg.includes('环境')) {
-                        setMessage(`环境错误: ${errorMsg}`);
+                    } else if (errorMsg.includes('Tauri') || errorMsg.toLowerCase().includes('environment') || errorMsg.includes('环境')) {
+                        setMessage(t('common.environment_error', { error: errorMsg }));
                     } else {
                         setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.error')}: ${errorMsg}`);
                     }
@@ -172,9 +172,9 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
             // 如果是 refresh_token 缺失错误,显示完整信息(包含解决方案)
             if (errorMsg.includes('Refresh Token') || errorMsg.includes('refresh_token')) {
                 setMessage(errorMsg);
-            } else if (errorMsg.includes('Tauri') || errorMsg.includes('环境')) {
+            } else if (errorMsg.includes('Tauri') || errorMsg.toLowerCase().includes('environment') || errorMsg.includes('环境')) {
                 // 环境错误
-                setMessage(`环境错误: ${errorMsg}`);
+                setMessage(t('common.environment_error', { error: errorMsg }));
             } else {
                 // 其他错误
                 setMessage(`${actionName} ${t('common.error')}: ${errorMsg}`);
@@ -346,19 +346,28 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     return (
         <>
             <button
-                className="px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-2 shadow-sm border border-gray-200/50 dark:border-base-300"
-                onClick={() => setIsOpen(true)}
+                className="px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-2 shadow-sm border border-gray-200/50 dark:border-base-300 relative z-[100]"
+                onClick={() => {
+                    console.log('AddAccountDialog button clicked');
+                    setIsOpen(true);
+                }}
             >
                 <Plus className="w-4 h-4" />
                 {t('accounts.add_account')}
             </button>
 
             {isOpen && createPortal(
-                <dialog className="modal modal-open z-[100]">
+                <div 
+                    className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/50 backdrop-blur-sm"
+                    style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
+                >
                     {/* Draggable Top Region */}
-                    <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-8 z-[110]" />
+                    <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-8 z-[1]" />
 
-                    <div className="modal-box bg-white dark:bg-base-100 text-gray-900 dark:text-base-content">
+                    {/* Click outside to close */}
+                    <div className="absolute inset-0 z-[0]" onClick={() => setIsOpen(false)} />
+
+                    <div className="bg-white dark:bg-base-100 text-gray-900 dark:text-base-content rounded-2xl shadow-2xl w-full max-w-lg p-6 relative z-[10] m-4 max-h-[90vh] overflow-y-auto">
                         <h3 className="font-bold text-lg mb-4">{t('accounts.add.title')}</h3>
 
                         {/* Tab 导航 - 胶囊风格 */}
@@ -556,8 +565,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                             )}
                         </div>
                     </div>
-                    <div className="modal-backdrop bg-black/40 backdrop-blur-sm fixed inset-0 z-[-1]" onClick={() => setIsOpen(false)}></div>
-                </dialog>,
+                </div>,
                 document.body
             )}
         </>

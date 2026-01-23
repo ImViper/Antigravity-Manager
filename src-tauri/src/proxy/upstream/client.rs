@@ -78,6 +78,18 @@ impl UpstreamClient {
         body: Value,
         query_string: Option<&str>,
     ) -> Result<Response, String> {
+        self.call_v1_internal_with_headers(method, access_token, body, query_string, std::collections::HashMap::new()).await
+    }
+
+    /// [FIX #765] 调用 v1internal API，支持透传额外的 Headers
+    pub async fn call_v1_internal_with_headers(
+        &self,
+        method: &str,
+        access_token: &str,
+        body: Value,
+        query_string: Option<&str>,
+        extra_headers: std::collections::HashMap<String, String>,
+    ) -> Result<Response, String> {
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
         headers.insert(
@@ -93,6 +105,15 @@ impl UpstreamClient {
             header::USER_AGENT,
             header::HeaderValue::from_static("antigravity/1.11.9 windows/amd64"),
         );
+
+        // 注入额外的 Headers (如 anthropic-beta)
+        for (k, v) in extra_headers {
+            if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
+                if let Ok(hv) = header::HeaderValue::from_str(&v) {
+                    headers.insert(hk, hv);
+                }
+            }
+        }
 
         let mut last_err: Option<String> = None;
 
@@ -181,6 +202,7 @@ impl UpstreamClient {
     /// 获取可用模型列表
     /// 
     /// 获取远端模型列表，支持多端点自动 Fallback
+    #[allow(dead_code)] // API ready for future model discovery feature
     pub async fn fetch_available_models(&self, access_token: &str) -> Result<Value, String> {
         let mut headers = header::HeaderMap::new();
         headers.insert(

@@ -1,6 +1,7 @@
 // OpenAI Handler
-use axum::{extract::Json, extract::State, http::StatusCode, response::IntoResponse};
-use base64::Engine as _;
+use axum::{extract::Json, extract::State, http::StatusCode, response::IntoResponse, response::Response};
+use base64::Engine as _; 
+use bytes::Bytes;
 use serde_json::{json, Value};
 use tracing::{debug, error, info}; // Import Engine trait for encode method
 
@@ -12,11 +13,113 @@ use crate::proxy::server::AppState;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 use crate::proxy::session_manager::SessionManager;
+use tokio::time::{sleep, Duration};
+
+/// 重试策略枚举
+#[derive(Debug, Clone)]
+enum RetryStrategy {
+    NoRetry,
+    FixedDelay(Duration),
+    LinearBackoff { base_ms: u64 },
+    ExponentialBackoff { base_ms: u64, max_ms: u64 },
+}
+
+fn determine_retry_strategy(status_code: u16, error_text: &str) -> RetryStrategy {
+    match status_code {
+        429 => {
+            if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
+                let actual_delay = delay_ms.saturating_add(200).min(10_000);
+                RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
+            } else {
+                RetryStrategy::LinearBackoff { base_ms: 1000 }
+            }
+        }
+        503 | 529 => RetryStrategy::ExponentialBackoff { base_ms: 1000, max_ms: 8000 },
+        500 => RetryStrategy::LinearBackoff { base_ms: 500 },
+        401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(100)),
+        _ => RetryStrategy::NoRetry,
+    }
+}
+
+async fn apply_retry_strategy(strategy: RetryStrategy, attempt: usize, status_code: u16, trace_id: &str) -> bool {
+    match strategy {
+        RetryStrategy::NoRetry => {
+            debug!("[{}] Non-retryable error {}, stopping", trace_id, status_code);
+            false
+        }
+        RetryStrategy::FixedDelay(duration) => {
+            info!("[{}] ⏱️ Retry with fixed delay: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
+            sleep(duration).await;
+            true
+        }
+        RetryStrategy::LinearBackoff { base_ms } => {
+            let delay = base_ms * (attempt as u64 + 1);
+            info!("[{}] ⏱️ Retry with linear backoff: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
+            sleep(Duration::from_millis(delay)).await;
+            true
+        }
+        RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
+             let delay = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
+             info!("[{}] ⏱️ Retry with exponential backoff: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
+             sleep(Duration::from_millis(delay)).await;
+             true
+        }
+    }
+}
 
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // [NEW] 自动检测并转换 Responses 格式
+    // 如果请求包含 instructions 或 input 但没有 messages，则认为是 Responses 格式
+    let is_responses_format = !body.get("messages").is_some() 
+        && (body.get("instructions").is_some() || body.get("input").is_some());
+    
+    if is_responses_format {
+        debug!("Detected Responses API format, converting to Chat Completions format");
+        
+        // 转换 instructions 为 system message
+        if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
+            if !instructions.is_empty() {
+                let system_msg = json!({
+                    "role": "system",
+                    "content": instructions
+                });
+                
+                // 初始化 messages 数组
+                if !body.get("messages").is_some() {
+                    body["messages"] = json!([]);
+                }
+                
+                // 将 system message 插入到开头
+                if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                    messages.insert(0, system_msg);
+                }
+            }
+        }
+        
+        // 转换 input 为 user message（如果存在）
+        if let Some(input) = body.get("input") {
+            let user_msg = if input.is_string() {
+                json!({
+                    "role": "user",
+                    "content": input.as_str().unwrap_or("")
+                })
+            } else {
+                // input 是数组格式，暂时简化处理
+                json!({
+                    "role": "user",
+                    "content": input.to_string()
+                })
+            };
+            
+            if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                messages.push(user_msg);
+            }
+        }
+    }
+
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
 
@@ -30,6 +133,7 @@ pub async fn handle_chat_completions(
                 content: Some(crate::proxy::mappers::openai::OpenAIContent::String(
                     " ".to_string(),
                 )),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -45,15 +149,15 @@ pub async fn handle_chat_completions(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
+    let mut last_email: Option<String> = None;
+
+    // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
+    let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &openai_req.model,
+        &*state.custom_mapping.read().await,
+    );
 
     for attempt in 0..max_attempts {
-        // 2. 预解析模型路由与配置
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &openai_req.model,
-            &*state.custom_mapping.read().await,
-            &*state.openai_mapping.read().await,
-            &*state.anthropic_mapping.read().await,
-        );
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -63,6 +167,8 @@ pub async fn handle_chat_completions(
             &openai_req.model,
             &mapped_model,
             &tools_val,
+            None,  // size (not used in handler, transform_openai_request handles it)
+            None   // quality
         );
 
         // 3. 提取 SessionId (粘性指纹)
@@ -71,7 +177,7 @@ pub async fn handle_chat_completions(
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
         let (access_token, project_id, email) = match token_manager
-            .get_token(&config.request_type, attempt > 0, Some(&session_id))
+            .get_token(&config.request_type, attempt > 0, Some(&session_id), &openai_req.model)
             .await
         {
             Ok(t) => t,
@@ -83,6 +189,7 @@ pub async fn handle_chat_completions(
             }
         };
 
+        last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求
@@ -94,13 +201,14 @@ pub async fn handle_chat_completions(
         }
 
         // 5. 发送请求
-        let list_response = openai_req.stream;
-        let method = if list_response {
+        let actual_stream = openai_req.stream;
+        
+        let method = if actual_stream {
             "streamGenerateContent"
         } else {
             "generateContent"
         };
-        let query_string = if list_response { Some("alt=sse") } else { None };
+        let query_string = if actual_stream { Some("alt=sse") } else { None };
 
         let response = match upstream
             .call_v1_internal(method, &access_token, gemini_body, query_string)
@@ -122,24 +230,98 @@ pub async fn handle_chat_completions(
         let status = response.status();
         if status.is_success() {
             // 5. 处理流式 vs 非流式
-            if list_response {
+            if actual_stream {
                 use crate::proxy::mappers::openai::streaming::create_openai_sse_stream;
                 use axum::body::Body;
                 use axum::response::Response;
-                // Removed redundant StreamExt
+                use futures::StreamExt;
 
                 let gemini_stream = response.bytes_stream();
-                let openai_stream =
+                
+                // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
+                // Pre-read until we find meaningful content, skip heartbeats
+                let mut openai_stream =
                     create_openai_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
-                let body = Body::from_stream(openai_stream);
-
-                return Ok(Response::builder()
-                    .header("Content-Type", "text/event-stream")
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "keep-alive")
-                    .body(body)
-                    .unwrap()
-                    .into_response());
+                
+                let mut first_data_chunk = None;
+                let mut retry_this_account = false;
+                
+                // Loop to skip heartbeats during peek
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_secs(60), openai_stream.next()).await {
+                        Ok(Some(Ok(bytes))) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            
+                            let text = String::from_utf8_lossy(&bytes);
+                            // Skip SSE comments/pings (heartbeats)
+                            if text.trim().starts_with(":") || text.trim().starts_with("data: :") {
+                                tracing::debug!("[OpenAI] Skipping peek heartbeat");
+                                continue;
+                            }
+                            
+                            // Check for error events
+                            if text.contains("\"error\"") {
+                                tracing::warn!("[OpenAI] Error detected during peek, retrying...");
+                                last_error = "Error event during peek".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
+                            
+                            // We found real data!
+                            first_data_chunk = Some(bytes);
+                            break;
+                        }
+                        Ok(Some(Err(e))) => {
+                            tracing::warn!("[OpenAI] Stream error during peek: {}, retrying...", e);
+                            last_error = format!("Stream error during peek: {}", e);
+                            retry_this_account = true;
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("[OpenAI] Stream ended during peek (Empty Response), retrying...");
+                            last_error = "Empty response stream during peek".to_string();
+                            retry_this_account = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("[OpenAI] Timeout waiting for first data (60s), retrying...");
+                            last_error = "Timeout waiting for first data".to_string();
+                            retry_this_account = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if retry_this_account {
+                    continue; // Rotate to next account
+                }
+                
+                // Combine first chunk with remaining stream
+                let combined_stream = futures::stream::once(async move { 
+                    Ok::<Bytes, String>(first_data_chunk.unwrap()) 
+                })
+                .chain(openai_stream);
+                
+                if actual_stream {
+                    // 客户端请求流式，返回 SSE
+                    let body = Body::from_stream(combined_stream);
+                    return Ok(Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "keep-alive")
+                        .header("X-Accel-Buffering", "no")
+                        .header("X-Account-Email", &email)
+                        .header("X-Mapped-Model", &mapped_model)
+                        .body(body)
+                        .unwrap()
+                        .into_response());
+                } else {
+                    // 非流式请求（虽然内部可能走流但这里按原始需求转换）
+                    // 实际上既然实际流已经是 actual_stream 了，这里的逻辑应该一致
+                    unreachable!("actual_stream should be the original stream flag");
+                }
             }
 
             let gemini_resp: Value = response
@@ -148,7 +330,7 @@ pub async fn handle_chat_completions(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
             let openai_response = transform_openai_response(&gemini_resp);
-            return Ok(Json(openai_response).into_response());
+            return Ok((StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(openai_response)).into_response());
         }
 
         // 处理特定错误并重试
@@ -192,7 +374,7 @@ pub async fn handle_chat_completions(
                     attempt + 1,
                     max_attempts
                 );
-                return Err((status, error_text));
+                return Ok((status, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], error_text).into_response());
             }
 
             // 3. 其他限流或服务器过载情况，轮换账号
@@ -204,6 +386,43 @@ pub async fn handle_chat_completions(
                 max_attempts
             );
             continue;
+        }
+
+        // [NEW] 处理 400 错误 (Thinking 签名失效)
+        if status_code == 400 
+            && (error_text.contains("Invalid `signature`")
+                || error_text.contains("thinking.signature")
+                || error_text.contains("Invalid signature")
+                || error_text.contains("Corrupted thought signature"))
+        {
+            tracing::warn!(
+                "[OpenAI] Signature error detected on account {}, retrying without thinking",
+                email
+            );
+            
+            // 追加修复提示词到最后一条用户消息
+            if let Some(last_msg) = openai_req.messages.last_mut() {
+                if last_msg.role == "user" {
+                    let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
+                    
+                    if let Some(content) = &mut last_msg.content {
+                        use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
+                        match content {
+                            OpenAIContent::String(s) => {
+                                s.push_str(repair_prompt);
+                            }
+                            OpenAIContent::Array(arr) => {
+                                arr.push(OpenAIContentBlock::Text {
+                                    text: repair_prompt.to_string()
+                                });
+                            }
+                        }
+                        tracing::debug!("[OpenAI] Appended repair prompt to last user message");
+                    }
+                }
+            }
+            
+            continue; // 重试
         }
 
         // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
@@ -223,14 +442,23 @@ pub async fn handle_chat_completions(
             "OpenAI Upstream non-retryable error {} on account {}: {}",
             status_code, email, error_text
         );
-        return Err((status, error_text));
+        return Ok((status, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], error_text).into_response());
     }
 
     // 所有尝试均失败
-    Err((
-        StatusCode::TOO_MANY_REQUESTS,
-        format!("All accounts exhausted. Last error: {}", last_error),
-    ))
+    if let Some(email) = last_email {
+        Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
+            format!("All accounts exhausted. Last error: {}", last_error),
+        ).into_response())
+    } else {
+        Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("X-Mapped-Model", mapped_model)],
+            format!("All accounts exhausted. Last error: {}", last_error),
+        ).into_response())
+    }
 }
 
 /// 处理 Legacy Completions API (/v1/completions)
@@ -238,13 +466,13 @@ pub async fn handle_chat_completions(
 pub async fn handle_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Response {
     info!(
         "Received /v1/completions or /v1/responses payload: {:?}",
         body
     );
 
-    let is_codex_style = body.get("input").is_some() && body.get("instructions").is_some();
+    let is_codex_style = body.get("input").is_some() || body.get("instructions").is_some();
 
     // 1. Convert Payload to Messages (Shared Chat Format)
     if is_codex_style {
@@ -493,8 +721,92 @@ pub async fn handle_completions(
     // Actually, due to SSE handling differences (Codex uses different event format), we replicate the loop here or abstract it.
     // For now, let's replicate the core loop but with Codex specific SSE mapping.
 
-    let mut openai_req: OpenAIRequest = serde_json::from_value(body.clone())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+    // [Fix Phase 2] Backport normalization logic from handle_chat_completions
+    // Handle "instructions" + "input" (Codex style) -> system + user messages
+    // This is critical because `transform_openai_request` expects `messages` to be populated.
+    
+    // [FIX] 检查是否已经有 messages (被第一次标准化处理过)
+    let has_codex_fields = body.get("instructions").is_some() || body.get("input").is_some();
+    let already_normalized = body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    
+    // 只有在未标准化时才进行简单转换
+    if has_codex_fields && !already_normalized {
+        tracing::debug!("[Codex] Performing simple normalization (messages not yet populated)");
+        
+        let mut messages = Vec::new();
+        
+        // instructions -> system message
+        if let Some(inst) = body.get("instructions").and_then(|v| v.as_str()) {
+            if !inst.is_empty() {
+                messages.push(json!({
+                    "role": "system",
+                    "content": inst 
+                }));
+            }
+        }
+        
+        // input -> user message (支持对象数组形式的对话历史)
+        if let Some(input) = body.get("input") {
+            if let Some(s) = input.as_str() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": s
+                }));
+            } else if let Some(arr) = input.as_array() {
+                // 判断是消息对象数组还是简单的内容块/字符串数组
+                let is_message_array = arr.first().and_then(|v| v.as_object()).map(|obj| obj.contains_key("role")).unwrap_or(false);
+                
+                if is_message_array {
+                    // 深度识别：像处理 messages 一样处理 input 数组
+                    for item in arr {
+                        messages.push(item.clone());
+                    }
+                } else {
+                    // 降级处理：传统的字符串或混合内容拼接
+                    let content = arr.iter().map(|v| {
+                        if let Some(s) = v.as_str() { s.to_string() }
+                        else if v.is_object() { v.to_string() }
+                        else { "".to_string() }
+                    }).collect::<Vec<_>>().join("\n");
+                    
+                    if !content.is_empty() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": content
+                        }));
+                    }
+                }
+            } else {
+                let content = input.to_string();
+                if !content.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": content
+                    }));
+                }
+            };
+        }
+        
+        if let Some(obj) = body.as_object_mut() {
+            tracing::debug!("[Codex] Injecting normalized messages: {} messages", messages.len());
+            obj.insert("messages".to_string(), json!(messages));
+        }
+    } else if already_normalized {
+        tracing::debug!("[Codex] Skipping normalization (messages already populated by first pass)");
+    }
+
+    let mut openai_req: OpenAIRequest = match serde_json::from_value(body.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request: {}", e),
+            ).into_response();
+        }
+    };
 
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
@@ -505,6 +817,7 @@ pub async fn handle_completions(
                 content: Some(crate::proxy::mappers::openai::OpenAIContent::String(
                     " ".to_string(),
                 )),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -517,14 +830,17 @@ pub async fn handle_completions(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
+    let mut last_email: Option<String> = None;
 
-    for _attempt in 0..max_attempts {
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &openai_req.model,
-            &*state.custom_mapping.read().await,
-            &*state.openai_mapping.read().await,
-            &*state.anthropic_mapping.read().await,
-        );
+    // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
+    let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &openai_req.model,
+        &*state.custom_mapping.read().await,
+    );
+    let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
+
+    for attempt in 0..max_attempts {
+        // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -534,27 +850,39 @@ pub async fn handle_completions(
             &openai_req.model,
             &mapped_model,
             &tools_val,
+            None,  // size
+            None   // quality
         );
 
+        // 3. 提取 SessionId (复用)
+        // [New] 使用 TokenManager 内部逻辑提取 session_id，支持粘性调度
+        let session_id_str = SessionManager::extract_openai_session_id(&openai_req);
+        let session_id = Some(session_id_str.as_str());
+        
+        // 重试时强制轮换，除非只是简单的网络抖动但 Claude 逻辑里 attempt > 0 总是 force_rotate
+        let force_rotate = attempt > 0;
+
         let (access_token, project_id, email) =
-            match token_manager.get_token(&config.request_type, false, None).await {
+            match token_manager.get_token(&config.request_type, force_rotate, session_id, &openai_req.model).await {
                 Ok(t) => t,
                 Err(e) => {
-                    return Err((
+                    return (
                         StatusCode::SERVICE_UNAVAILABLE,
+                        [("X-Mapped-Model", mapped_model)],
                         format!("Token error: {}", e),
-                    ))
+                    ).into_response()
                 }
             };
+        
+        last_email = Some(email.clone());
 
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let gemini_body = transform_openai_request(&openai_req, &project_id, &mapped_model);
 
-        // [New] 打印转换后的报文 (Gemini Body) 供调试 (Codex 路径)
-        if let Ok(body_json) = serde_json::to_string_pretty(&gemini_body) {
-            debug!("[Codex-Request] Transformed Gemini Body:\n{}", body_json);
-        }
+        // [New] 打印转换后的报文 (Gemini Body) 供调试 (Codex 路径) ———— 缩减为 simple debug
+        debug!("[Codex-Request] Transformed Gemini Body ({} parts)", 
+           gemini_body.get("contents").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0));
 
         let list_response = openai_req.stream;
         let method = if list_response {
@@ -571,42 +899,113 @@ pub async fn handle_completions(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                debug!("Codex Request failed on attempt {}/{}: {}", attempt + 1, max_attempts, e);
                 continue;
             }
         };
 
         let status = response.status();
         if status.is_success() {
+            // [智能限流] 请求成功，重置该账号的连续失败计数
+            token_manager.mark_account_success(&email);
+
             if list_response {
                 use axum::body::Body;
                 use axum::response::Response;
+                use futures::StreamExt;
 
                 let gemini_stream = response.bytes_stream();
-                let body = if is_codex_style {
+                let mut openai_stream = if is_codex_style {
                     use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
-                    let s =
-                        create_codex_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
-                    Body::from_stream(s)
+                    create_codex_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
                 } else {
                     use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
-                    let s =
-                        create_legacy_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
-                    Body::from_stream(s)
+                    create_legacy_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
                 };
 
-                return Ok(Response::builder()
+                // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
+                let mut first_data_chunk = None;
+                let mut retry_this_account = false;
+                
+                // Loop to skip heartbeats during peek
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_secs(60), openai_stream.next()).await {
+                        Ok(Some(Ok(bytes))) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            
+                            let text = String::from_utf8_lossy(&bytes);
+                            // Skip SSE comments/pings (heartbeats)
+                            if text.trim().starts_with(":") || text.trim().starts_with("data: :") {
+                                tracing::debug!("[OpenAI-Legacy] Skipping peek heartbeat");
+                                continue;
+                            }
+                            
+                            // Check for error events
+                            if text.contains("\"error\"") {
+                                tracing::warn!("[OpenAI-Legacy] Error detected during peek, retrying...");
+                                last_error = "Error event during peek".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
+                            
+                            // We found real data!
+                            first_data_chunk = Some(bytes);
+                            break;
+                        }
+                        Ok(Some(Err(e))) => {
+                            tracing::warn!("[OpenAI-Legacy] Stream error during peek: {}, retrying...", e);
+                            last_error = format!("Stream error during peek: {}", e);
+                            retry_this_account = true;
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("[OpenAI-Legacy] Stream ended during peek (Empty Response), retrying...");
+                            last_error = "Empty response stream during peek".to_string();
+                            retry_this_account = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("[OpenAI-Legacy] Timeout waiting for first data (60s), retrying...");
+                            last_error = "Timeout waiting for first data".to_string();
+                            retry_this_account = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if retry_this_account {
+                    continue; // Rotate to next account
+                }
+                
+                // Combine first chunk with remaining stream
+                let combined_stream = futures::stream::once(async move { 
+                    Ok::<Bytes, String>(first_data_chunk.unwrap()) 
+                })
+                .chain(openai_stream);
+
+                return Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "keep-alive")
-                    .body(body)
+                    .header("X-Account-Email", &email)
+                    .header("X-Mapped-Model", &mapped_model)
+                    .body(Body::from_stream(combined_stream))
                     .unwrap()
-                    .into_response());
+                    .into_response();
             }
 
-            let gemini_resp: Value = response
-                .json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            let gemini_resp: Value = match response.json().await {
+                Ok(json) => json,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        [("X-Mapped-Model", mapped_model.as_str())],
+                        format!("Parse error: {}", e),
+                    ).into_response();
+                }
+            };
 
             let chat_resp = transform_openai_response(&gemini_resp);
 
@@ -628,36 +1027,63 @@ pub async fn handle_completions(
                 "object": "text_completion",
                 "created": chat_resp.created,
                 "model": chat_resp.model,
-                "choices": choices
+                "choices": choices,
+                "usage": chat_resp.usage
             });
 
-            return Ok(axum::Json(legacy_resp).into_response());
+            return (StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(legacy_resp)).into_response();
         }
 
         // Handle errors and retry
         let status_code = status.as_u16();
-        let error_text = response.text().await.unwrap_or_default();
+        let retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
 
-        if status_code == 429 || status_code == 403 || status_code == 401 {
-            continue;
+        tracing::error!(
+            "[Codex-Upstream] Error Response {}: {}",
+            status_code,
+            error_text
+        );
+
+        // 3. 标记限流状态(用于 UI 显示)
+        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+            token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&mapped_model)).await;
         }
-        return Err((status, error_text));
+
+        // 确定重试策略
+        let strategy = determine_retry_strategy(status_code, &error_text);
+        
+        if apply_retry_strategy(strategy, attempt, status_code, &trace_id).await {
+            // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
+            continue;
+        } else {
+            // 不可重试
+            return (status, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], error_text).into_response();
+        }
     }
 
-    Err((
-        StatusCode::TOO_MANY_REQUESTS,
-        format!("All attempts failed. Last error: {}", last_error),
-    ))
+    // 所有尝试均失败
+    if let Some(email) = last_email {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
+            format!("All accounts exhausted. Last error: {}", last_error),
+        ).into_response()
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("X-Mapped-Model", mapped_model)],
+            format!("All accounts exhausted. Last error: {}", last_error),
+        ).into_response()
+    }
 }
 
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {
     use crate::proxy::common::model_mapping::get_all_dynamic_models;
 
     let model_ids = get_all_dynamic_models(
-        &state.openai_mapping,
         &state.custom_mapping,
-        &state.anthropic_mapping,
     ).await;
 
     let data: Vec<_> = model_ids.into_iter().map(|id| {
@@ -723,17 +1149,14 @@ pub async fn handle_images_generations(
         style
     );
 
-    // 2. 解析尺寸为宽高比
-    let aspect_ratio = match size {
-        "1792x768" | "2560x1080" => "21:9", // Ultra-wide
-        "1792x1024" | "1920x1080" => "16:9",
-        "1024x1792" | "1080x1920" => "9:16",
-        "1024x768" | "1280x960" => "4:3",
-        "768x1024" | "960x1280" => "3:4",
-        _ => "1:1", // 默认 1024x1024
-    };
+    // 2. 使用 common_utils 解析图片配置（统一逻辑，支持动态计算宽高比和 quality 映射）
+    let (image_config, _) = crate::proxy::mappers::common_utils::parse_image_config_with_params(
+        model,
+        Some(size),
+        Some(quality)
+    );
 
-    // Prompt Enhancement
+    // 3. Prompt Enhancement（保留原有逻辑）
     let mut final_prompt = prompt.to_string();
     if quality == "hd" {
         final_prompt.push_str(", (high quality, highly detailed, 4k resolution, hdr)");
@@ -744,11 +1167,11 @@ pub async fn handle_images_generations(
         _ => {}
     }
 
-    // 3. 获取 Token
+    // 4. 获取 Token
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
 
-    let (access_token, project_id, email) = match token_manager.get_token("image_gen", false, None).await
+    let (access_token, project_id, email) = match token_manager.get_token("image_gen", false, None, "dall-e-3").await
     {
         Ok(t) => t,
         Err(e) => {
@@ -761,7 +1184,7 @@ pub async fn handle_images_generations(
 
     info!("✓ Using account: {} for image generation", email);
 
-    // 4. 并发发送请求 (解决 candidateCount > 1 不支持的问题)
+    // 5. 并发发送请求 (解决 candidateCount > 1 不支持的问题)
     let mut tasks = Vec::new();
 
     for _ in 0..n {
@@ -769,13 +1192,13 @@ pub async fn handle_images_generations(
         let access_token = access_token.clone();
         let project_id = project_id.clone();
         let final_prompt = final_prompt.clone();
-        let aspect_ratio = aspect_ratio.to_string();
+        let image_config = image_config.clone(); // 使用解析后的完整配置
         let _response_format = response_format.to_string();
 
         tasks.push(tokio::spawn(async move {
             let gemini_body = json!({
                 "project": project_id,
-                "requestId": format!("img-{}", uuid::Uuid::new_v4()),
+                "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
                 "model": "gemini-3-pro-image",
                 "userAgent": "antigravity",
                 "requestType": "image_gen",
@@ -786,9 +1209,7 @@ pub async fn handle_images_generations(
                     }],
                     "generationConfig": {
                         "candidateCount": 1, // 强制单张
-                        "imageConfig": {
-                            "aspectRatio": aspect_ratio
-                        }
+                        "imageConfig": image_config // ✅ 使用完整配置（包含 aspectRatio 和 imageSize）
                     },
                     "safetySettings": [
                         { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
@@ -904,7 +1325,11 @@ pub async fn handle_images_generations(
         "data": images
     });
 
-    Ok(Json(openai_response))
+    Ok((
+        StatusCode::OK,
+        [("X-Account-Email", email.as_str())],
+        Json(openai_response)
+    ).into_response())
 }
 
 pub async fn handle_images_edits(
@@ -998,7 +1423,7 @@ pub async fn handle_images_edits(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     // Fix: Proper get_token call with correct signature and unwrap (using image_gen quota)
-    let (access_token, project_id, _email) = match token_manager.get_token("image_gen", false, None).await
+    let (access_token, project_id, email) = match token_manager.get_token("image_gen", false, None, "dall-e-3").await
     {
         Ok(t) => t,
         Err(e) => {
@@ -1176,5 +1601,9 @@ pub async fn handle_images_edits(
         "data": images
     });
 
-    Ok(Json(openai_response))
+    Ok((
+        StatusCode::OK,
+        [("X-Account-Email", email.as_str())],
+        Json(openai_response)
+    ).into_response())
 }

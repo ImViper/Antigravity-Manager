@@ -12,12 +12,15 @@ pub struct ProxyRequestLog {
     pub url: String,
     pub status: u16,
     pub duration: u64, // ms
-    pub model: Option<String>,
+    pub model: Option<String>,        // 客户端请求的模型名
+    pub mapped_model: Option<String>, // 实际路由后使用的模型名
+    pub account_email: Option<String>,
     pub error: Option<String>,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    pub protocol: Option<String>,     // 协议类型: "openai", "anthropic", "gemini"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,6 +45,20 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
+        // Auto cleanup old logs (keep last 30 days)
+        tokio::spawn(async {
+            match crate::modules::proxy_db::cleanup_old_logs(30) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cleanup old logs: {}", e);
+                }
+            }
+        });
+
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
             stats: RwLock::new(ProxyStats::default()),
@@ -60,6 +77,20 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
+        if let (Some(account), Some(input), Some(output)) = (
+            &log.account_email,
+            log.input_tokens,
+            log.output_tokens,
+        ) {
+            let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
+            let account = account.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::modules::token_stats::record_usage(&account, &model, input, output) {
+                    tracing::debug!("Failed to record token stats: {}", e);
+                }
+            });
+        }
+
         if !self.is_enabled() {
             return;
         }
@@ -90,11 +121,40 @@ impl ProxyMonitor {
             if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
             }
+            
+            // Record token stats if available
+            if let (Some(account), Some(input), Some(output)) = (
+                &log_to_save.account_email,
+                log_to_save.input_tokens,
+                log_to_save.output_tokens,
+            ) {
+                let model = log_to_save.model.clone().unwrap_or_else(|| "unknown".to_string());
+                if let Err(e) = crate::modules::token_stats::record_usage(account, &model, input, output) {
+                    tracing::debug!("Failed to record token stats: {}", e);
+                }
+            }
         });
 
-        // Emit event
+        // Emit event (send summary only, without body to reduce memory)
         if let Some(app) = &self.app_handle {
-             let _ = app.emit("proxy://request", &log);
+            let log_summary = ProxyRequestLog {
+                id: log.id.clone(),
+                timestamp: log.timestamp,
+                method: log.method.clone(),
+                url: log.url.clone(),
+                status: log.status,
+                duration: log.duration,
+                model: log.model.clone(),
+                mapped_model: log.mapped_model.clone(),
+                account_email: log.account_email.clone(),
+                error: log.error.clone(),
+                request_body: None,  // Don't send body in event
+                response_body: None, // Don't send body in event
+                input_tokens: log.input_tokens,
+                output_tokens: log.output_tokens,
+                protocol: log.protocol.clone(),
+            };
+            let _ = app.emit("proxy://request", &log_summary);
         }
     }
 

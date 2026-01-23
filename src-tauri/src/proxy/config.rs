@@ -116,6 +116,61 @@ impl Default for ZaiConfig {
     }
 }
 
+/// 实验性功能配置 (Feature Flags)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    /// 启用双层签名缓存 (Signature Cache)
+    #[serde(default = "default_true")]
+    pub enable_signature_cache: bool,
+
+    /// 启用工具循环自动恢复 (Tool Loop Recovery)
+    #[serde(default = "default_true")]
+    pub enable_tool_loop_recovery: bool,
+
+    /// 启用跨模型兼容性检查 (Cross-Model Checks)
+    #[serde(default = "default_true")]
+    pub enable_cross_model_checks: bool,
+
+    /// 启用上下文用量缩放 (Context Usage Scaling)
+    /// 用于解决客户端因 Gemini 上下文过大而错误触发压缩的问题
+    #[serde(default = "default_true")]
+    pub enable_usage_scaling: bool,
+
+    /// 上下文压缩阈值 L1 (Tool Trimming)
+    #[serde(default = "default_threshold_l1")]
+    pub context_compression_threshold_l1: f32,
+
+    /// 上下文压缩阈值 L2 (Thinking Compression)
+    #[serde(default = "default_threshold_l2")]
+    pub context_compression_threshold_l2: f32,
+
+    /// 上下文压缩阈值 L3 (Fork + Summary)
+    #[serde(default = "default_threshold_l3")]
+    pub context_compression_threshold_l3: f32,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            enable_signature_cache: true,
+            enable_tool_loop_recovery: true,
+            enable_cross_model_checks: true,
+            enable_usage_scaling: true,
+            context_compression_threshold_l1: 0.4,
+            context_compression_threshold_l2: 0.55,
+            context_compression_threshold_l3: 0.7,
+        }
+    }
+}
+
+fn default_threshold_l1() -> f32 { 0.4 }
+fn default_threshold_l2() -> f32 { 0.55 }
+fn default_threshold_l3() -> f32 { 0.7 }
+
+fn default_true() -> bool {
+    true
+}
+
 /// 反代服务配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -135,24 +190,15 @@ pub struct ProxyConfig {
     /// - auto: recommended defaults (currently: allow_lan_access => all_except_health, else off)
     #[serde(default)]
     pub auth_mode: ProxyAuthMode,
-    
+
     /// 监听端口
     pub port: u16,
-    
+
     /// API 密钥
     pub api_key: String,
-    
 
     /// 是否自动启动
     pub auto_start: bool,
-
-    /// Anthropic 模型映射表 (key: Claude模型名, value: Gemini模型名)
-    #[serde(default)]
-    pub anthropic_mapping: std::collections::HashMap<String, String>,
-
-    /// OpenAI 模型映射表 (key: OpenAI模型组, value: Gemini模型名)
-    #[serde(default)]
-    pub openai_mapping: std::collections::HashMap<String, String>,
 
     /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
     #[serde(default)]
@@ -173,10 +219,14 @@ pub struct ProxyConfig {
     /// z.ai provider configuration (Anthropic-compatible).
     #[serde(default)]
     pub zai: ZaiConfig,
-    
+
     /// 账号调度配置 (粘性会话/限流重试)
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
+
+    /// 实验性功能配置
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
 }
 
 /// 上游代理配置
@@ -197,20 +247,19 @@ impl Default for ProxyConfig {
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
             auto_start: false,
-            anthropic_mapping: std::collections::HashMap::new(),
-            openai_mapping: std::collections::HashMap::new(),
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),
-            enable_logging: false, // 默认关闭，节省性能
+            enable_logging: true, // 默认开启，支持 token 统计功能
             upstream_proxy: UpstreamProxyConfig::default(),
             zai: ZaiConfig::default(),
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
+            experimental: ExperimentalConfig::default(),
         }
     }
 }
 
 fn default_request_timeout() -> u64 {
-    120  // 默认 120 秒,原来 60 秒太短
+    120 // 默认 120 秒,原来 60 秒太短
 }
 
 fn default_zai_base_url() -> String {

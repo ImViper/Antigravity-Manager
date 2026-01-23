@@ -17,8 +17,6 @@ use std::sync::atomic::AtomicUsize;
 #[derive(Clone)]
 pub struct AppState {
     pub token_manager: Arc<TokenManager>,
-    pub anthropic_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    pub openai_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     pub custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     #[allow(dead_code)]
     pub request_timeout: u64, // API 请求超时(秒)
@@ -31,34 +29,26 @@ pub struct AppState {
     pub provider_rr: Arc<AtomicUsize>,
     pub zai_vision_mcp: Arc<crate::proxy::zai_vision_mcp::ZaiVisionMcpState>,
     pub monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
+    pub experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
 }
 
 /// Axum 服务器实例
 pub struct AxumServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
-    anthropic_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    openai_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     security_state: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,
     zai_state: Arc<RwLock<crate::proxy::ZaiConfig>>,
+    experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
 }
 
 impl AxumServer {
     pub async fn update_mapping(&self, config: &crate::proxy::config::ProxyConfig) {
         {
-            let mut m = self.anthropic_mapping.write().await;
-            *m = config.anthropic_mapping.clone();
-        }
-        {
-            let mut m = self.openai_mapping.write().await;
-            *m = config.openai_mapping.clone();
-        }
-        {
             let mut m = self.custom_mapping.write().await;
             *m = config.custom_mapping.clone();
         }
-        tracing::debug!("模型映射 (Anthropic/OpenAI/Custom) 已全量热更新");
+        tracing::debug!("模型映射 (Custom) 已全量热更新");
     }
 
     /// 更新代理配置
@@ -79,23 +69,26 @@ impl AxumServer {
         *zai = config.zai.clone();
         tracing::info!("z.ai 配置已热更新");
     }
+
+    pub async fn update_experimental(&self, config: &crate::proxy::config::ProxyConfig) {
+        let mut exp = self.experimental.write().await;
+        *exp = config.experimental.clone();
+        tracing::info!("实验性配置已热更新");
+    }
     /// 启动 Axum 服务器
     pub async fn start(
         host: String,
         port: u16,
         token_manager: Arc<TokenManager>,
-        anthropic_mapping: std::collections::HashMap<String, String>,
-        openai_mapping: std::collections::HashMap<String, String>,
         custom_mapping: std::collections::HashMap<String, String>,
         _request_timeout: u64,
         upstream_proxy: crate::proxy::config::UpstreamProxyConfig,
         security_config: crate::proxy::ProxySecurityConfig,
         zai_config: crate::proxy::ZaiConfig,
         monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
+        experimental_config: crate::proxy::config::ExperimentalConfig,
 
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
-        let mapping_state = Arc::new(tokio::sync::RwLock::new(anthropic_mapping));
-        let openai_mapping_state = Arc::new(tokio::sync::RwLock::new(openai_mapping));
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
 	        let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy.clone()));
 	        let security_state = Arc::new(RwLock::new(security_config));
@@ -103,11 +96,10 @@ impl AxumServer {
 	        let provider_rr = Arc::new(AtomicUsize::new(0));
 	        let zai_vision_mcp_state =
 	            Arc::new(crate::proxy::zai_vision_mcp::ZaiVisionMcpState::new());
+	        let experimental_state = Arc::new(RwLock::new(experimental_config));
 
 	        let state = AppState {
 	            token_manager: token_manager.clone(),
-	            anthropic_mapping: mapping_state.clone(),
-	            openai_mapping: openai_mapping_state.clone(),
 	            custom_mapping: custom_mapping_state.clone(),
 	            request_timeout: 300, // 5分钟超时
             thought_signature_map: Arc::new(tokio::sync::Mutex::new(
@@ -121,6 +113,7 @@ impl AxumServer {
             provider_rr: provider_rr.clone(),
             zai_vision_mcp: zai_vision_mcp_state,
             monitor: monitor.clone(),
+            experimental: experimental_state.clone(),
         };
 
 
@@ -147,6 +140,10 @@ impl AxumServer {
                 "/v1/images/edits",
                 post(handlers::openai::handle_images_edits),
             ) // 图像编辑 API
+            .route(
+                "/v1/audio/transcriptions",
+                post(handlers::audio::handle_audio_transcription),
+            ) // 音频转录 API
             // Claude Protocol
             .route("/v1/messages", post(handlers::claude::handle_messages))
             .route(
@@ -182,6 +179,7 @@ impl AxumServer {
                 post(handlers::gemini::handle_count_tokens),
             ) // Specific route priority
             .route("/v1/models/detect", post(handlers::common::handle_detect_model))
+            .route("/internal/warmup", post(handlers::warmup::handle_warmup)) // 内部预热端点
             .route("/v1/api/event_logging/batch", post(silent_ok_handler))
             .route("/v1/api/event_logging", post(silent_ok_handler))
             .route("/healthz", get(health_check_handler))
@@ -208,12 +206,11 @@ impl AxumServer {
 
         let server_instance = Self {
             shutdown_tx: Some(shutdown_tx),
-            anthropic_mapping: mapping_state.clone(),
-            openai_mapping: openai_mapping_state.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
             security_state,
             zai_state,
+            experimental: experimental_state.clone(),
         };
 
         // 在新任务中启动服务器
